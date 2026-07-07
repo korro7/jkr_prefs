@@ -202,8 +202,8 @@ void CHertzMindlin::configForTimeStep(NApiCore::ICustomPropertyDataApi_1_0* simP
     /*                of the geometry equipment called "Bucket"                           */
     /**************************************************************************************/
 
-    m_geomMgr->resetCustomProperty("Blade", Adhesion_PROPERTY.c_str(), 0.0);
-    m_geomMgr->resetCustomProperty("Blade", Friction_PROPERTY.c_str(), 0.0);
+    m_geomMgr->resetCustomProperty("blade", Adhesion_PROPERTY.c_str(), 0.0);
+    m_geomMgr->resetCustomProperty("blade", Friction_PROPERTY.c_str(), 0.0);
 
 }
 
@@ -510,9 +510,9 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
         F_td = CSimple3DVector();
         newF_t = CSimple3DVector();
     }
-    else if(F_t.length() > F_hertz.length() * (staticFriction) )
+    else if(F_t.length() > hertzForce * staticFriction )
     {
-        newF_t = F_t * F_hertz.length() * (staticFriction) / F_t.length();
+        newF_t = F_t * hertzForce * staticFriction / F_t.length();
         nOverlap_t = -newF_t / S_t; //slippage has occurred so the tangential overlap is reduced a bit
 
         //at this point we get energy loss from the sliding!
@@ -560,7 +560,7 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
     {
         CSimple3DVector torque2 = angVel2;
         torque2.normalise();
-        torque2 *= -newF_n.length() * elem2PhysicalRadius * rollingFriction;
+        torque2 *= -hertzForce * elem2PhysicalRadius * rollingFriction;
         calculatedElem2AdditionalTorqueX = torque2.dx();
         calculatedElem2AdditionalTorqueY = torque2.dy();
         calculatedElem2AdditionalTorqueZ = torque2.dz();
@@ -584,7 +584,7 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
 
         double* FrictionDelta = elem2PropData->getDelta(Friction_PROPERTY.c_str());
 
-        FrictionDelta[0] += hertzForce * 0.58;
+        FrictionDelta[0] += hertzForce * staticFriction;
     }
    
 
