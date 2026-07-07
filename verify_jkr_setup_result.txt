@@ -1,0 +1,3 @@
+getPreferenceFileName: jkr_prefs.txt
+setup returned: true
+customMsg: 
