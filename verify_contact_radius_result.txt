@@ -1,0 +1,6 @@
+setupOk=true
+physicalOnly ok=1 normal=(-0.000850424,0,0)
+shellOnly ok=1 normal=(0.00404769,0,0)
+shellAndPhysical ok=1 normal=(0.00217071,0,0)
+radius3ShellOnly ok=1 normal=(1.13474,0,0)
+radius3NearPhysical ok=1 normal=(-1.2278,0,0)

@@ -4,6 +4,8 @@
 #include "Helpers.h"
 
 #include "ICustomPropertyManagerApi_1_0.h"
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <sstream>
 
@@ -13,6 +15,42 @@ using namespace std;
 using namespace NApi;
 using namespace NApiCore;
 using namespace NApiCm;
+
+namespace
+{
+    const double OVERLAP_EPS = 1.0e-12;
+    const double ROOT_IMAG_EPS = 1.0e-8;
+
+    double clampNonNegative(double value)
+    {
+        return value > 0.0 ? value : 0.0;
+    }
+
+    double safeEquivalentRadius(double radiusA, double radiusB)
+    {
+        if (radiusA <= OVERLAP_EPS || radiusB <= OVERLAP_EPS)
+        {
+            return 0.0;
+        }
+
+        return radiusA * radiusB / (radiusA + radiusB);
+    }
+
+    double selectPositiveRealRoot(const double rr[4], const double ri[4])
+    {
+        double selected = -1.0;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            if (std::fabs(ri[i]) <= ROOT_IMAG_EPS && std::isfinite(rr[i]) && rr[i] > selected)
+            {
+                selected = rr[i];
+            }
+        }
+
+        return selected;
+    }
+}
 
 const string CHertzMindlin::PREFS_FILE = "jkr_prefs.txt";
 const string CHertzMindlin::Adhesion_PROPERTY = "Adhesion";
@@ -326,9 +364,13 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
     CSimple3DVector relVel_n = unitCPVect * unitCPVect.dot(relVel);
     CSimple3DVector relVel_t = relVel - relVel_n;
 
+    // When EDEM Contact Radius is enabled, keep the contact geometry aligned
+    // with the expanded contact shells instead of assuming physical == contact.
+    double interactionRadius1 = elem1ContactRadius > OVERLAP_EPS ? elem1ContactRadius : elem1PhysicalRadius;
+    double interactionRadius2 = elem2ContactRadius > OVERLAP_EPS ? elem2ContactRadius : elem2PhysicalRadius;
+
     // Equivalent radii & mass
-    double nEquivRadius = elem1PhysicalRadius * elem2PhysicalRadius /
-        (elem1PhysicalRadius + elem2PhysicalRadius);
+    double nEquivRadius = safeEquivalentRadius(interactionRadius1, interactionRadius2);
 
     double nEquivMass = elem1Mass * elem2Mass /
                         (elem1Mass + elem2Mass);
@@ -355,6 +397,8 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
 
     /* Cohesion JKR */
     double nSurfaceEnergy         = m_cohesiveItems.getCohesion(elem1Type, elem2Type);
+    double positivePhysicalOverlap = clampNonNegative(normalPhysicalOverlap);
+    double positiveContactOverlap = clampNonNegative(normalContactOverlap);
 
 
     //if (nSurfaceEnergy <= 1e-12)
@@ -363,22 +407,44 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
     double cohesionForce = 0.0;
     double hertzForce = 0.0;
 
-    if ( nSurfaceEnergy > 0.0 )
+    if (positivePhysicalOverlap <= OVERLAP_EPS && positiveContactOverlap <= OVERLAP_EPS)
+    {
+        return eSuccess;
+    }
+
+    if (nSurfaceEnergy <= 0.0 && positivePhysicalOverlap <= OVERLAP_EPS)
+    {
+        return eSuccess;
+    }
+
+    if (nSurfaceEnergy > 0.0 && nEquivRadius > OVERLAP_EPS)
         {
             double a[5], rr[4], ri[4];
             a[0]= 1.0 / nEquivRadius / nEquivRadius;
             a[1]= 0.0;
-            a[2]= - 2.0 * normalPhysicalOverlap / nEquivRadius;
+            a[2]= - 2.0 * positivePhysicalOverlap / nEquivRadius;
             a[3]= -4.0*PI*nSurfaceEnergy/ nEquivYoungsMod;
-            a[4]= normalPhysicalOverlap * normalPhysicalOverlap;
+            a[4]= positivePhysicalOverlap * positivePhysicalOverlap;
             quart(a, rr, ri);
-            double nContactRadius = rr[3]; // right root of quartic equation selected
-        
+            double nContactRadius = selectPositiveRealRoot(rr, ri);
+
+            if (nContactRadius <= OVERLAP_EPS)
+            {
+                nContactRadius = std::sqrt(clampNonNegative(nEquivRadius * positivePhysicalOverlap));
+            }
+
+            double maxPatchRadius = std::min(interactionRadius1, interactionRadius2);
+            if (maxPatchRadius > OVERLAP_EPS)
+            {
+                nContactRadius = std::min(nContactRadius, maxPatchRadius);
+            }
+         
             cohesionForce = 4.0*sqrt(PI * nSurfaceEnergy * nEquivYoungsMod) * pow(nContactRadius, 1.5);
             hertzForce = 4.0 / 3.0 * nEquivYoungsMod / nEquivRadius * pow(nContactRadius, 3.0);
-        } else
+        }
+    else if (positivePhysicalOverlap > OVERLAP_EPS && nEquivRadius > OVERLAP_EPS)
         {
-            hertzForce = ( 4.0 / 3.0 * nEquivYoungsMod * sqrt(nEquivRadius) ) * pow(normalPhysicalOverlap, 1.5);
+            hertzForce = ( 4.0 / 3.0 * nEquivYoungsMod * sqrt(nEquivRadius) ) * pow(positivePhysicalOverlap, 1.5);
         }
         
     CSimple3DVector F_hertz  = - unitCPVect * hertzForce;
@@ -397,8 +463,13 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
         B = - myLog/ sqrt(myLog * myLog + PI * PI);
     }
 
-    double S_n = 2.0 * nEquivYoungsMod * sqrt(nEquivRadius * normalPhysicalOverlap);
-    CSimple3DVector F_nd = unitCPVect * 2 * sqrt(5.0 / 6.0) * B * sqrt(S_n * nEquivMass) *  relVel_n.length();
+    double S_n = 0.0;
+    CSimple3DVector F_nd;
+    if (positivePhysicalOverlap > OVERLAP_EPS && nEquivRadius > OVERLAP_EPS)
+    {
+        S_n = 2.0 * nEquivYoungsMod * sqrt(nEquivRadius * positivePhysicalOverlap);
+        F_nd = unitCPVect * 2 * sqrt(5.0 / 6.0) * B * sqrt(S_n * nEquivMass) * relVel_n.length();
+    }
 
     // Are we in a loading situation?
     if(relVel_n.dot(unitCPVect) > 0.0)
@@ -420,14 +491,26 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
     /* Tangential Calculation    */
     /*****************************/
 
-    double S_t =  8.0 * nEquivShearMod * sqrt(nEquivRadius * normalPhysicalOverlap);
     CSimple3DVector nOverlap_t(tangentialPhysicalOverlapX, tangentialPhysicalOverlapY, tangentialPhysicalOverlapZ);
-    CSimple3DVector F_t = -nOverlap_t * S_t;
+    double S_t = 0.0;
+    CSimple3DVector F_t;
 
     // Damping
     CSimple3DVector F_td, newF_t;
 
-    if(F_t.length() > F_hertz.length() * (staticFriction) )
+    if (positivePhysicalOverlap > OVERLAP_EPS && nEquivRadius > OVERLAP_EPS)
+    {
+        S_t =  8.0 * nEquivShearMod * sqrt(nEquivRadius * positivePhysicalOverlap);
+        F_t = -nOverlap_t * S_t;
+    }
+
+    if (S_t <= OVERLAP_EPS)
+    {
+        nOverlap_t = CSimple3DVector();
+        F_td = CSimple3DVector();
+        newF_t = CSimple3DVector();
+    }
+    else if(F_t.length() > F_hertz.length() * (staticFriction) )
     {
         newF_t = F_t * F_hertz.length() * (staticFriction) / F_t.length();
         nOverlap_t = -newF_t / S_t; //slippage has occurred so the tangential overlap is reduced a bit
