@@ -1,0 +1,22 @@
+PASS Release DLL loads
+PASS Plugin exports resolve
+PASS Plugin implements API V2_3_0
+PASS setup reads jkr_prefs.txt
+PASS all contact history and diagnostics are registered
+PASS Physical=3 Contact=3.01 shell-only call is finite
+PASS first approach at physical overlap -0.009 has zero force
+PASS contact radius does not change force or JKR patch
+PASS physical contact establishes JKR history
+PASS established JKR contact carries force at negative physical overlap
+PASS JKR contact clears cleanly beyond theoretical separation
+PASS final tangential force is capped by the JKR repulsive limit
+PASS geometry Friction exports actual force, not capacity
+PASS history rolling torque is nonzero and limited
+PASS rolling torque opposes motion and reaction torque is balanced
+PASS invalid radius fails safe without NaN or Inf
+criticalSeparation=-6.08487e-05
+physical3_contact3.01_initialForce=0
+contactRadiusIndependentForce=1.15442
+actualTangentialForce=6.18998 limit=6.18998
+rollingTorque=1.39491 limit=2.52575
+failures=0

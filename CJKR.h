@@ -30,6 +30,17 @@ class CHertzMindlin : public NApiCm::IPluginContactModelV2_3_0
         static const std::string PREFS_FILE;
         static const string Adhesion_PROPERTY;
         static const string Friction_PROPERTY;
+        static const string CONTACT_STATE_PROPERTY;
+        static const string ROLLING_DISPLACEMENT_PROPERTY;
+        static const string ACTUAL_TANGENTIAL_FORCE_PROPERTY;
+        static const string TANGENTIAL_FORCE_LIMIT_PROPERTY;
+        static const string REPULSIVE_NORMAL_FORCE_PROPERTY;
+        static const string ADHESIVE_NORMAL_FORCE_PROPERTY;
+        static const string NET_NORMAL_FORCE_PROPERTY;
+        static const string CONTACT_PATCH_RADIUS_PROPERTY;
+        static const string CONTACT_SLIP_SPEED_PROPERTY;
+        static const string ROLLING_TORQUE_PROPERTY;
+        static const string ROLLING_TORQUE_LIMIT_PROPERTY;
 
 
          /**

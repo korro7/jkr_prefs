@@ -1,11 +1,12 @@
 #include "CJKR.h"
-#include "quarticroot.h"
 
 #include "Helpers.h"
 
 #include "ICustomPropertyManagerApi_1_0.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <string>
 #include <sstream>
 
@@ -19,7 +20,9 @@ using namespace NApiCm;
 namespace
 {
     const double OVERLAP_EPS = 1.0e-12;
-    const double ROOT_IMAG_EPS = 1.0e-8;
+    const double VECTOR_EPS_SQUARED = 1.0e-30;
+    const double TYPE_C_ROLLING_STIFFNESS_FACTOR = 2.0;
+    const int JKR_ROOT_ITERATIONS = 100;
 
     double clampNonNegative(double value)
     {
@@ -36,28 +39,181 @@ namespace
         return radiusA * radiusB / (radiusA + radiusB);
     }
 
-    double selectPositiveRealRoot(const double rr[4], const double ri[4])
+    bool isPositiveFinite(double value)
     {
-        double selected = -1.0;
+        return std::isfinite(value) && value > 0.0;
+    }
 
-        for (int i = 0; i < 4; ++i)
+    double effectivePropertyValue(NApiCore::ICustomPropertyDataApi_1_0* data,
+                                  const char* name,
+                                  unsigned int element)
+    {
+        if (data == 0 || !data->hasData(name))
         {
-            if (std::fabs(ri[i]) <= ROOT_IMAG_EPS && std::isfinite(rr[i]) && rr[i] > selected)
+            return 0.0;
+        }
+
+        const double* value = data->getValue(name);
+        double* delta = data->getDelta(name);
+        return value != 0 && delta != 0 ? value[element] + delta[element] : 0.0;
+    }
+
+    void setPropertyValue(NApiCore::ICustomPropertyDataApi_1_0* data,
+                          const char* name,
+                          unsigned int element,
+                          double target)
+    {
+        if (data == 0 || !data->hasData(name) || !std::isfinite(target))
+        {
+            return;
+        }
+
+        const double* value = data->getValue(name);
+        double* delta = data->getDelta(name);
+        if (value != 0 && delta != 0)
+        {
+            delta[element] += target - (value[element] + delta[element]);
+        }
+    }
+
+    void setVectorProperty(NApiCore::ICustomPropertyDataApi_1_0* data,
+                           const char* name,
+                           const CSimple3DVector& value)
+    {
+        setPropertyValue(data, name, 0, value.dx());
+        setPropertyValue(data, name, 1, value.dy());
+        setPropertyValue(data, name, 2, value.dz());
+    }
+
+    CSimple3DVector getVectorProperty(NApiCore::ICustomPropertyDataApi_1_0* data,
+                                      const char* name)
+    {
+        return CSimple3DVector(effectivePropertyValue(data, name, 0),
+                               effectivePropertyValue(data, name, 1),
+                               effectivePropertyValue(data, name, 2));
+    }
+
+    double jkrSeparation(double patchRadius,
+                         double equivalentRadius,
+                         double equivalentYoungsModulus,
+                         double surfaceEnergy)
+    {
+        return patchRadius * patchRadius / equivalentRadius
+             - std::sqrt(4.0 * PI * surfaceEnergy * patchRadius /
+                         equivalentYoungsModulus);
+    }
+
+    bool solveStableJkrPatchRadius(double physicalOverlap,
+                                   double equivalentRadius,
+                                   double equivalentYoungsModulus,
+                                   double surfaceEnergy,
+                                   double& patchRadius,
+                                   double& criticalSeparation)
+    {
+        patchRadius = 0.0;
+        criticalSeparation = 0.0;
+
+        if (!std::isfinite(physicalOverlap) ||
+            !isPositiveFinite(equivalentRadius) ||
+            !isPositiveFinite(equivalentYoungsModulus) ||
+            !isPositiveFinite(surfaceEnergy))
+        {
+            return false;
+        }
+
+        const double cutFactor = 0.75 - 1.0 / std::sqrt(2.0);
+        const double cutoffPatch = std::cbrt(
+            9.0 * PI * surfaceEnergy * equivalentRadius * equivalentRadius *
+            cutFactor / (2.0 * equivalentYoungsModulus));
+        criticalSeparation = jkrSeparation(cutoffPatch,
+                                           equivalentRadius,
+                                           equivalentYoungsModulus,
+                                           surfaceEnergy);
+
+        const double separationTolerance = std::max(
+            1.0e-15,
+            1.0e-12 * std::max(equivalentRadius, std::fabs(criticalSeparation)));
+        if (!std::isfinite(criticalSeparation) ||
+            physicalOverlap < criticalSeparation - separationTolerance)
+        {
+            return false;
+        }
+
+        // On the stable JKR branch separation(a) is monotonic above this point.
+        double lower = std::cbrt(PI * surfaceEnergy * equivalentRadius *
+                                 equivalentRadius /
+                                 (4.0 * equivalentYoungsModulus));
+        if (!isPositiveFinite(lower))
+        {
+            return false;
+        }
+
+        double upper = std::max(2.0 * lower,
+            std::sqrt(equivalentRadius * clampNonNegative(physicalOverlap)) +
+            2.0 * lower);
+        int expansion = 0;
+        while (expansion < 64 &&
+               jkrSeparation(upper, equivalentRadius,
+                             equivalentYoungsModulus, surfaceEnergy) < physicalOverlap)
+        {
+            upper *= 2.0;
+            ++expansion;
+        }
+
+        if (!isPositiveFinite(upper) || expansion == 64)
+        {
+            return false;
+        }
+
+        for (int iteration = 0; iteration < JKR_ROOT_ITERATIONS; ++iteration)
+        {
+            const double middle = 0.5 * (lower + upper);
+            const double calculatedSeparation = jkrSeparation(
+                middle, equivalentRadius, equivalentYoungsModulus, surfaceEnergy);
+            if (!std::isfinite(calculatedSeparation))
             {
-                selected = rr[i];
+                return false;
+            }
+
+            if (calculatedSeparation < physicalOverlap)
+            {
+                lower = middle;
+            }
+            else
+            {
+                upper = middle;
             }
         }
 
-        return selected;
+        patchRadius = 0.5 * (lower + upper);
+        const double residual = std::fabs(jkrSeparation(
+            patchRadius, equivalentRadius, equivalentYoungsModulus, surfaceEnergy) -
+            physicalOverlap);
+        const double residualTolerance = std::max(
+            1.0e-14,
+            1.0e-10 * std::max(equivalentRadius, std::fabs(physicalOverlap)));
+        return isPositiveFinite(patchRadius) && residual <= residualTolerance;
     }
 }
 
 const string CHertzMindlin::PREFS_FILE = "jkr_prefs.txt";
 const string CHertzMindlin::Adhesion_PROPERTY = "Adhesion";
 const string CHertzMindlin::Friction_PROPERTY = "Friction";
+const string CHertzMindlin::CONTACT_STATE_PROPERTY = "JKR Contact State";
+const string CHertzMindlin::ROLLING_DISPLACEMENT_PROPERTY = "JKR Rolling Displacement";
+const string CHertzMindlin::ACTUAL_TANGENTIAL_FORCE_PROPERTY = "JKR Actual Tangential Force";
+const string CHertzMindlin::TANGENTIAL_FORCE_LIMIT_PROPERTY = "JKR Tangential Force Limit";
+const string CHertzMindlin::REPULSIVE_NORMAL_FORCE_PROPERTY = "JKR Repulsive Normal Force";
+const string CHertzMindlin::ADHESIVE_NORMAL_FORCE_PROPERTY = "JKR Adhesive Normal Force";
+const string CHertzMindlin::NET_NORMAL_FORCE_PROPERTY = "JKR Net Normal Force";
+const string CHertzMindlin::CONTACT_PATCH_RADIUS_PROPERTY = "JKR Contact Patch Radius";
+const string CHertzMindlin::CONTACT_SLIP_SPEED_PROPERTY = "JKR Contact Slip Speed";
+const string CHertzMindlin::ROLLING_TORQUE_PROPERTY = "JKR Rolling Torque";
+const string CHertzMindlin::ROLLING_TORQUE_LIMIT_PROPERTY = "JKR Rolling Torque Limit";
 
 CHertzMindlin::CHertzMindlin() :
-    m_cohesiveItems()
+    m_cohesiveItems(),
+    m_geomMgr(0)
 
 {
     ;
@@ -86,33 +242,64 @@ bool CHertzMindlin::setup(NApiCore::IApiManager_1_0& apiManager,
 {
     customMsg[0] = '\0';
 
-    ifstream prefsFile(prefFile);
+    if (prefFile == 0 || prefFile[0] == '\0')
+    {
+        std::strncpy(customMsg, "JKR preference file path is empty.",
+                     NApi::ERROR_MSG_MAX_LENGTH - 1);
+        customMsg[NApi::ERROR_MSG_MAX_LENGTH - 1] = '\0';
+        return false;
+    }
 
-    if(!prefsFile)
+    ifstream prefsFile(prefFile);
+    if (!prefsFile)
+    {
+        std::strncpy(customMsg, "Unable to open the JKR preference file.",
+                     NApi::ERROR_MSG_MAX_LENGTH - 1);
+        customMsg[NApi::ERROR_MSG_MAX_LENGTH - 1] = '\0';
+        return false;
+    }
+
+    m_cohesiveItems.clear();
+    string line;
+    unsigned int lineNumber = 0;
+    while (std::getline(prefsFile, line))
+    {
+        ++lineNumber;
+        const string::size_type comment = line.find('#');
+        if (comment != string::npos)
         {
+            line.erase(comment);
+        }
+
+        istringstream parser(line);
+        string pairName;
+        double surfaceEnergy = 0.0;
+        if (!(parser >> pairName))
+        {
+            continue;
+        }
+
+        const string::size_type separator = pairName.find(':');
+        if (!(parser >> surfaceEnergy) || separator == string::npos ||
+            separator == 0 || separator + 1 >= pairName.size() ||
+            !std::isfinite(surfaceEnergy) || surfaceEnergy < 0.0)
+        {
+            ostringstream error;
+            error << "Invalid JKR preference at line " << lineNumber
+                  << ". Expected materialA:materialB nonNegativeSurfaceEnergy.";
+            const string message = error.str();
+            std::strncpy(customMsg, message.c_str(),
+                         NApi::ERROR_MSG_MAX_LENGTH - 1);
+            customMsg[NApi::ERROR_MSG_MAX_LENGTH - 1] = '\0';
             return false;
         }
-    else
-        {
-            double surfaceEnergy;
-            string str;
-            while (prefsFile)
-                {
-                    prefsFile >> str
-                              >> surfaceEnergy;
-                    
-                    string::size_type i (str.find (':'));
-                    string surfA = str.substr (0, i);
-                    str.erase (0, i + 1);
-                    string surfB = str;
-                    
-                    m_cohesiveItems.addCohesion(surfA, surfB,surfaceEnergy);
-                }
 
-        }
-    
+        m_cohesiveItems.addCohesion(pairName.substr(0, separator),
+                                    pairName.substr(separator + 1),
+                                    surfaceEnergy);
+    }
+
     return true;
-    
 }
 
 bool CHertzMindlin::usesCustomProperties()
@@ -130,7 +317,7 @@ unsigned int CHertzMindlin::getNumberOfRequiredProperties(
     }
     else if (category == eContact)
     {
-        return 1;
+        return 11;
     }
     else
     {
@@ -150,7 +337,7 @@ bool CHertzMindlin::getDetailsForProperty(
 {
     const char* defVal = "0";
 
-    // 几何属性 第0个：粘附能
+    // Geometry totals are retained for existing EDEM decks and Analyst plots.
     if (propertyIndex == 0 && eGeometry == category)
     {
         strcpy(name, Adhesion_PROPERTY.c_str());
@@ -160,7 +347,6 @@ bool CHertzMindlin::getDetailsForProperty(
         strcpy(initValBuff, defVal);
         return true;
     }
-    // 几何属性 第1个：摩擦属性
     else if (propertyIndex == 1 && eGeometry == category)
     {
         strcpy(name, Friction_PROPERTY.c_str());
@@ -168,6 +354,70 @@ bool CHertzMindlin::getDetailsForProperty(
         numberOfElements = 1;
         unitType = eForce;
         strcpy(initValBuff, defVal);
+        return true;
+    }
+
+    if (eContact == category)
+    {
+        const string* propertyName = 0;
+        switch (propertyIndex)
+        {
+            case 0:
+                propertyName = &CONTACT_STATE_PROPERTY;
+                unitType = eNone;
+                break;
+            case 1:
+                propertyName = &ROLLING_DISPLACEMENT_PROPERTY;
+                unitType = eLength;
+                numberOfElements = 3;
+                break;
+            case 2:
+                propertyName = &ACTUAL_TANGENTIAL_FORCE_PROPERTY;
+                unitType = eForce;
+                break;
+            case 3:
+                propertyName = &TANGENTIAL_FORCE_LIMIT_PROPERTY;
+                unitType = eForce;
+                break;
+            case 4:
+                propertyName = &REPULSIVE_NORMAL_FORCE_PROPERTY;
+                unitType = eForce;
+                break;
+            case 5:
+                propertyName = &ADHESIVE_NORMAL_FORCE_PROPERTY;
+                unitType = eForce;
+                break;
+            case 6:
+                propertyName = &NET_NORMAL_FORCE_PROPERTY;
+                unitType = eForce;
+                break;
+            case 7:
+                propertyName = &CONTACT_PATCH_RADIUS_PROPERTY;
+                unitType = eLength;
+                break;
+            case 8:
+                propertyName = &CONTACT_SLIP_SPEED_PROPERTY;
+                unitType = eVelocity;
+                break;
+            case 9:
+                propertyName = &ROLLING_TORQUE_PROPERTY;
+                unitType = eTorque;
+                break;
+            case 10:
+                propertyName = &ROLLING_TORQUE_LIMIT_PROPERTY;
+                unitType = eTorque;
+                break;
+            default:
+                return false;
+        }
+
+        strcpy(name, propertyName->c_str());
+        dataType = eDouble;
+        if (propertyIndex != 1)
+        {
+            numberOfElements = 1;
+        }
+        strcpy(initValBuff, propertyIndex == 1 ? "0,0,0" : defVal);
         return true;
     }
 
@@ -202,8 +452,11 @@ void CHertzMindlin::configForTimeStep(NApiCore::ICustomPropertyDataApi_1_0* simP
     /*                of the geometry equipment called "Bucket"                           */
     /**************************************************************************************/
 
-    m_geomMgr->resetCustomProperty("blade", Adhesion_PROPERTY.c_str(), 0.0);
-    m_geomMgr->resetCustomProperty("blade", Friction_PROPERTY.c_str(), 0.0);
+    if (m_geomMgr != 0)
+    {
+        m_geomMgr->resetCustomProperty("blade", Adhesion_PROPERTY.c_str(), 0.0);
+        m_geomMgr->resetCustomProperty("blade", Friction_PROPERTY.c_str(), 0.0);
+    }
 
 }
 
@@ -318,22 +571,12 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
     double& calculatedElem2UnsymAdditionalTorqueZ,
     double& calculatedChargeMovedToElem1)
 {
-    // This contact model assumes that the Physical and the Contact radius are the same
+    // This is a complete base model. Contact radii are intentionally not used
+    // in any constitutive equation; EDEM uses them only to retain the contact.
+    (void)normalContactOverlap;
+    (void)elem1ContactRadius;
+    (void)elem2ContactRadius;
 
-    // Calculate the relative velocities of the elements
-    CSimple3DVector relVel = CSimple3DVector(elem1VelX, elem1VelY, elem1VelZ) -
-                             CSimple3DVector(elem2VelX, elem2VelY, elem2VelZ);
-
-    // Put the values into a more useful form
-    CSimple3DVector angVel1(elem1AngVelX, elem1AngVelY, elem1AngVelZ);
-    CSimple3DVector angVel2(elem2AngVelX, elem2AngVelY, elem2AngVelZ);
-    CSimple3DPoint  contactPoint(contactPointX, contactPointY, contactPointZ);
-
-    // The unit vector from element 1 to the contact point
-    CSimple3DVector unitCPVect = contactPoint - CSimple3DPoint(elem1PosX, elem1PosY, elem1PosZ) ;
-    unitCPVect.normalise();
-
-    // Clear return values
     calculatedNormalForceX = 0.0;
     calculatedNormalForceY = 0.0;
     calculatedNormalForceZ = 0.0;
@@ -359,234 +602,399 @@ NApi::ECalculateResult CHertzMindlin::calculateForce(
     calculatedElem2UnsymAdditionalTorqueY = 0.0;
     calculatedElem2UnsymAdditionalTorqueZ = 0.0;
     calculatedChargeMovedToElem1 = 0.0;
-
-    // normal and tangential components of the relative velocity at the contact point
-    CSimple3DVector relVel_n = unitCPVect * unitCPVect.dot(relVel);
-    CSimple3DVector relVel_t = relVel - relVel_n;
-
-    // When EDEM Contact Radius is enabled, keep the contact geometry aligned
-    // with the expanded contact shells instead of assuming physical == contact.
-    double interactionRadius1 = elem1ContactRadius > OVERLAP_EPS ? elem1ContactRadius : elem1PhysicalRadius;
-    double interactionRadius2 = elem2ContactRadius > OVERLAP_EPS ? elem2ContactRadius : elem2PhysicalRadius;
-
-    // Equivalent radii & mass
-    double nEquivRadius = safeEquivalentRadius(interactionRadius1, interactionRadius2);
-
-    double nEquivMass = elem1Mass * elem2Mass /
-                        (elem1Mass + elem2Mass);
-
-    // Effective Young's Modulus
-    double nYoungsMod1 = 2 * (1.0 + elem1Poisson) * elem1ShearMod;
-    double nYoungsMod2 = 2 * (1.0 + elem2Poisson) * elem2ShearMod;
-
-    // Equivalent Young's & shear modulus
-    double nEquivYoungsMod =  ( 1 - pow(elem1Poisson, 2) ) / nYoungsMod1
-                            + ( 1 - pow(elem2Poisson, 2) ) / nYoungsMod2;
-
-    nEquivYoungsMod = 1.0 / nEquivYoungsMod;
-
-    double nEquivShearMod =   ( 2.0 - elem1Poisson ) /  elem1ShearMod
-                            + ( 2.0 - elem2Poisson ) /  elem2ShearMod;
-
-    nEquivShearMod = 1.0 / nEquivShearMod;
-
-
-    /*****************************/
-    /* Normal Calculation        */
-    /*****************************/
-
-    /* Cohesion JKR */
-    double nSurfaceEnergy         = m_cohesiveItems.getCohesion(elem1Type, elem2Type);
-    double positivePhysicalOverlap = clampNonNegative(normalPhysicalOverlap);
-    double positiveContactOverlap = clampNonNegative(normalContactOverlap);
-
-
-    //if (nSurfaceEnergy <= 1e-12)
-        //nSurfaceEnergy = 5; // 自定义默认值
-
-    double cohesionForce = 0.0;
-    double hertzForce = 0.0;
-
-    if (positivePhysicalOverlap <= OVERLAP_EPS && positiveContactOverlap <= OVERLAP_EPS)
+    const auto resetContactHistory = [&]()
     {
+        tangentialPhysicalOverlapX = 0.0;
+        tangentialPhysicalOverlapY = 0.0;
+        tangentialPhysicalOverlapZ = 0.0;
+        setPropertyValue(contactPropData, CONTACT_STATE_PROPERTY.c_str(), 0, 0.0);
+        setVectorProperty(contactPropData, ROLLING_DISPLACEMENT_PROPERTY.c_str(),
+                          CSimple3DVector());
+        setPropertyValue(contactPropData, ACTUAL_TANGENTIAL_FORCE_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, TANGENTIAL_FORCE_LIMIT_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, REPULSIVE_NORMAL_FORCE_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, ADHESIVE_NORMAL_FORCE_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, NET_NORMAL_FORCE_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, CONTACT_PATCH_RADIUS_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, CONTACT_SLIP_SPEED_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, ROLLING_TORQUE_PROPERTY.c_str(), 0, 0.0);
+        setPropertyValue(contactPropData, ROLLING_TORQUE_LIMIT_PROPERTY.c_str(), 0, 0.0);
+    };
+
+    if (!std::isfinite(normalPhysicalOverlap) ||
+        !isPositiveFinite(elem1PhysicalRadius) ||
+        (elem2IsSurf && !isPositiveFinite(elem2PhysicalRadius)) ||
+        !isPositiveFinite(elem1ShearMod) ||
+        !isPositiveFinite(elem2ShearMod) ||
+        !std::isfinite(elem1Poisson) || !std::isfinite(elem2Poisson))
+    {
+        resetContactHistory();
         return eSuccess;
     }
 
-    if (nSurfaceEnergy <= 0.0 && positivePhysicalOverlap <= OVERLAP_EPS)
+    CSimple3DVector unitCPVect =
+        CSimple3DPoint(contactPointX, contactPointY, contactPointZ) -
+        CSimple3DPoint(elem1PosX, elem1PosY, elem1PosZ);
+    if (!std::isfinite(unitCPVect.lengthSquared()) ||
+        unitCPVect.lengthSquared() <= VECTOR_EPS_SQUARED)
     {
+        resetContactHistory();
+        return eSuccess;
+    }
+    unitCPVect.normalise();
+
+    const CSimple3DVector relVel =
+        CSimple3DVector(elem1ContactPointVelX, elem1ContactPointVelY,
+                        elem1ContactPointVelZ) -
+        CSimple3DVector(elem2ContactPointVelX, elem2ContactPointVelY,
+                        elem2ContactPointVelZ);
+    const CSimple3DVector relVel_n = unitCPVect * unitCPVect.dot(relVel);
+    const CSimple3DVector relVel_t = relVel - relVel_n;
+    const CSimple3DVector angVel1(elem1AngVelX, elem1AngVelY, elem1AngVelZ);
+    const CSimple3DVector angVel2(elem2AngVelX, elem2AngVelY, elem2AngVelZ);
+
+    // elem2IsSurf is true for a second particle surface and false for geometry.
+    const double nEquivRadius = elem2IsSurf
+        ? safeEquivalentRadius(elem1PhysicalRadius, elem2PhysicalRadius)
+        : elem1PhysicalRadius;
+    double nEquivMass = elem1Mass;
+    if (elem2IsSurf && isPositiveFinite(elem1Mass) && isPositiveFinite(elem2Mass) &&
+        isPositiveFinite(elem1Mass + elem2Mass))
+    {
+        nEquivMass = elem1Mass * elem2Mass / (elem1Mass + elem2Mass);
+    }
+
+    const double nYoungsMod1 = 2.0 * (1.0 + elem1Poisson) * elem1ShearMod;
+    const double nYoungsMod2 = 2.0 * (1.0 + elem2Poisson) * elem2ShearMod;
+    if (!isPositiveFinite(nEquivRadius) || !isPositiveFinite(nEquivMass) ||
+        !isPositiveFinite(nYoungsMod1) || !isPositiveFinite(nYoungsMod2))
+    {
+        resetContactHistory();
         return eSuccess;
     }
 
-    if (nSurfaceEnergy > 0.0 && nEquivRadius > OVERLAP_EPS)
+    const double inverseYoungs =
+        (1.0 - elem1Poisson * elem1Poisson) / nYoungsMod1 +
+        (1.0 - elem2Poisson * elem2Poisson) / nYoungsMod2;
+    const double inverseShear =
+        (2.0 - elem1Poisson) / elem1ShearMod +
+        (2.0 - elem2Poisson) / elem2ShearMod;
+    if (!isPositiveFinite(inverseYoungs) || !isPositiveFinite(inverseShear))
+    {
+        resetContactHistory();
+        return eSuccess;
+    }
+
+    const double nEquivYoungsMod = 1.0 / inverseYoungs;
+    const double nEquivShearMod = 1.0 / inverseShear;
+    double nSurfaceEnergy = m_cohesiveItems.getCohesion(elem1Type, elem2Type);
+    if (!std::isfinite(nSurfaceEnergy) || nSurfaceEnergy < 0.0)
+    {
+        nSurfaceEnergy = 0.0;
+    }
+
+    const double storedState = effectivePropertyValue(
+        contactPropData, CONTACT_STATE_PROPERTY.c_str(), 0);
+    bool contactEstablished = storedState > 0.5;
+    double contactPatchRadius = 0.0;
+    double criticalSeparation = 0.0;
+
+    if (nSurfaceEnergy > 0.0)
+    {
+        if (!contactEstablished)
         {
-            double a[5], rr[4], ri[4];
-            a[0]= 1.0 / nEquivRadius / nEquivRadius;
-            a[1]= 0.0;
-            a[2]= - 2.0 * positivePhysicalOverlap / nEquivRadius;
-            a[3]= -4.0*PI*nSurfaceEnergy/ nEquivYoungsMod;
-            a[4]= positivePhysicalOverlap * positivePhysicalOverlap;
-            quart(a, rr, ri);
-            double nContactRadius = selectPositiveRealRoot(rr, ri);
-
-            if (nContactRadius <= OVERLAP_EPS)
+            if (normalPhysicalOverlap < -OVERLAP_EPS)
             {
-                nContactRadius = std::sqrt(clampNonNegative(nEquivRadius * positivePhysicalOverlap));
+                resetContactHistory();
+                return eSuccess;
             }
-
-            double maxPatchRadius = std::min(interactionRadius1, interactionRadius2);
-            if (maxPatchRadius > OVERLAP_EPS)
-            {
-                nContactRadius = std::min(nContactRadius, maxPatchRadius);
-            }
-         
-            cohesionForce = 4.0*sqrt(PI * nSurfaceEnergy * nEquivYoungsMod) * pow(nContactRadius, 1.5);
-            hertzForce = 4.0 / 3.0 * nEquivYoungsMod / nEquivRadius * pow(nContactRadius, 3.0);
+            contactEstablished = true;
         }
-    else if (positivePhysicalOverlap > OVERLAP_EPS && nEquivRadius > OVERLAP_EPS)
+
+        if (!solveStableJkrPatchRadius(normalPhysicalOverlap, nEquivRadius,
+                                       nEquivYoungsMod, nSurfaceEnergy,
+                                       contactPatchRadius, criticalSeparation))
         {
-            hertzForce = ( 4.0 / 3.0 * nEquivYoungsMod * sqrt(nEquivRadius) ) * pow(positivePhysicalOverlap, 1.5);
+            resetContactHistory();
+            return eSuccess;
         }
-        
-    CSimple3DVector F_hertz  = - unitCPVect * hertzForce;
-    CSimple3DVector F_n  = - unitCPVect * (hertzForce - cohesionForce);
-
-    /* end of Cohesion JKR paragraph */
-
-
-
-
-    // Damping calculation
-    double B = 0.0;
-    if(coeffRest > 0.0)
-    {
-        double myLog = log(coeffRest);
-        B = - myLog/ sqrt(myLog * myLog + PI * PI);
-    }
-
-    double S_n = 0.0;
-    CSimple3DVector F_nd;
-    if (positivePhysicalOverlap > OVERLAP_EPS && nEquivRadius > OVERLAP_EPS)
-    {
-        S_n = 2.0 * nEquivYoungsMod * sqrt(nEquivRadius * positivePhysicalOverlap);
-        F_nd = unitCPVect * 2 * sqrt(5.0 / 6.0) * B * sqrt(S_n * nEquivMass) * relVel_n.length();
-    }
-
-    // Are we in a loading situation?
-    if(relVel_n.dot(unitCPVect) > 0.0)
-    {
-        F_nd = -F_nd;
-    }
-
-    // Fill in parameters we were passed in
-    CSimple3DVector newF_n = F_n + F_nd;
-    calculatedUnsymNormalForceX = F_nd.dx();
-    calculatedUnsymNormalForceY = F_nd.dy();
-    calculatedUnsymNormalForceZ = F_nd.dz();
-
-    calculatedNormalForceX = newF_n.dx();
-    calculatedNormalForceY = newF_n.dy();
-    calculatedNormalForceZ = newF_n.dz();
-
-    /*****************************/
-    /* Tangential Calculation    */
-    /*****************************/
-
-    CSimple3DVector nOverlap_t(tangentialPhysicalOverlapX, tangentialPhysicalOverlapY, tangentialPhysicalOverlapZ);
-    double S_t = 0.0;
-    CSimple3DVector F_t;
-
-    // Damping
-    CSimple3DVector F_td, newF_t;
-
-    if (positivePhysicalOverlap > OVERLAP_EPS && nEquivRadius > OVERLAP_EPS)
-    {
-        S_t =  8.0 * nEquivShearMod * sqrt(nEquivRadius * positivePhysicalOverlap);
-        F_t = -nOverlap_t * S_t;
-    }
-
-    if (S_t <= OVERLAP_EPS)
-    {
-        nOverlap_t = CSimple3DVector();
-        F_td = CSimple3DVector();
-        newF_t = CSimple3DVector();
-    }
-    else if(F_t.length() > hertzForce * staticFriction )
-    {
-        newF_t = F_t * hertzForce * staticFriction / F_t.length();
-        nOverlap_t = -newF_t / S_t; //slippage has occurred so the tangential overlap is reduced a bit
-
-        //at this point we get energy loss from the sliding!
-        F_td = newF_t;
     }
     else
     {
-        //at this point we get energy loss from the damping!
-        F_td = - relVel_t * 2 * sqrt(5.0 / 6.0) * B * sqrt(S_t * nEquivMass);
-        newF_t = F_t + F_td;
+        if (normalPhysicalOverlap <= OVERLAP_EPS)
+        {
+            resetContactHistory();
+            return eSuccess;
+        }
+        contactEstablished = true;
+        contactPatchRadius = std::sqrt(nEquivRadius * normalPhysicalOverlap);
     }
 
-    // Fill in parameters we were passed in
-    calculatedTangentialForceX = newF_t.dx();
-    calculatedTangentialForceY = newF_t.dy();
-    calculatedTangentialForceZ = newF_t.dz();
-    calculatedUnsymTangentialForceX = F_td.dx();
-    calculatedUnsymTangentialForceY = F_td.dy();
-    calculatedUnsymTangentialForceZ = F_td.dz();
-
-    tangentialPhysicalOverlapX = nOverlap_t.dx();
-    tangentialPhysicalOverlapY = nOverlap_t.dy();
-    tangentialPhysicalOverlapZ = nOverlap_t.dz();
-
-
-    /*****************************/
-    /* Rolling Friction          */
-    /*****************************/
-
-    // Only relevant if actually rolling
-    if(!isZero(angVel1.lengthSquared()))
+    const double maximumPhysicalPatch = elem2IsSurf
+        ? std::min(elem1PhysicalRadius, elem2PhysicalRadius)
+        : elem1PhysicalRadius;
+    contactPatchRadius = std::min(contactPatchRadius, maximumPhysicalPatch);
+    if (!isPositiveFinite(contactPatchRadius))
     {
-        CSimple3DVector torque1 = angVel1;
-        torque1.normalise();
-        torque1 *= -newF_n.length() * elem1PhysicalRadius * rollingFriction;
-        calculatedElem1AdditionalTorqueX = torque1.dx();
-        calculatedElem1AdditionalTorqueY = torque1.dy();
-        calculatedElem1AdditionalTorqueZ = torque1.dz();
-        calculatedElem1UnsymAdditionalTorqueX = torque1.dx();
-        calculatedElem1UnsymAdditionalTorqueY = torque1.dy();
-        calculatedElem1UnsymAdditionalTorqueZ = torque1.dz();
+        resetContactHistory();
+        return eSuccess;
     }
 
-    if(!isZero(angVel2.lengthSquared()))
+    const double patchCubed = contactPatchRadius * contactPatchRadius *
+                               contactPatchRadius;
+    double hertzForce = 4.0 * nEquivYoungsMod * patchCubed /
+                        (3.0 * nEquivRadius);
+    double cohesionForce = nSurfaceEnergy > 0.0
+        ? 4.0 * std::sqrt(PI * nSurfaceEnergy * nEquivYoungsMod * patchCubed)
+        : 0.0;
+    if (!std::isfinite(hertzForce) || !std::isfinite(cohesionForce) ||
+        hertzForce < 0.0 || cohesionForce < 0.0)
     {
-        CSimple3DVector torque2 = angVel2;
-        torque2.normalise();
-        torque2 *= -hertzForce * elem2PhysicalRadius * rollingFriction;
-        calculatedElem2AdditionalTorqueX = torque2.dx();
-        calculatedElem2AdditionalTorqueY = torque2.dy();
-        calculatedElem2AdditionalTorqueZ = torque2.dz();
-        calculatedElem2UnsymAdditionalTorqueX = torque2.dx();
-        calculatedElem2UnsymAdditionalTorqueY = torque2.dy();
-        calculatedElem2UnsymAdditionalTorqueZ = torque2.dz();
+        resetContactHistory();
+        return eSuccess;
     }
 
-    if (elem2IsSurf == false)
+    double dampingRatio = 0.0;
+    if (std::isfinite(coeffRest) && coeffRest < 1.0)
     {
-        //*Adhesion /
-      
-        double* AdhesionDelta = elem2PropData->getDelta(Adhesion_PROPERTY.c_str());
-
-        AdhesionDelta[0] += cohesionForce;
+        const double safeRestitution = std::max(coeffRest, 1.0e-12);
+        const double restitutionLog = std::log(safeRestitution);
+        dampingRatio = -restitutionLog /
+            std::sqrt(restitutionLog * restitutionLog + PI * PI);
     }
 
-    if (elem2IsSurf == false)
+    // The JKR patch remains finite for negative physical overlap, so it also
+    // controls normal and tangential stiffness during adhesive unloading.
+    const double normalStiffness = 2.0 * nEquivYoungsMod * contactPatchRadius;
+    const double normalDamping = 2.0 * std::sqrt(5.0 / 6.0) * dampingRatio *
+        std::sqrt(normalStiffness * nEquivMass);
+    const CSimple3DVector dissipativeNormalForce = -relVel_n * normalDamping;
+    const CSimple3DVector elasticNormalForce =
+        -unitCPVect * (hertzForce - cohesionForce);
+    const CSimple3DVector actualNormalForce =
+        elasticNormalForce + dissipativeNormalForce;
+
+    calculatedNormalForceX = actualNormalForce.dx();
+    calculatedNormalForceY = actualNormalForce.dy();
+    calculatedNormalForceZ = actualNormalForce.dz();
+    calculatedUnsymNormalForceX = dissipativeNormalForce.dx();
+    calculatedUnsymNormalForceY = dissipativeNormalForce.dy();
+    calculatedUnsymNormalForceZ = dissipativeNormalForce.dz();
+
+    CSimple3DVector tangentialOverlap(tangentialPhysicalOverlapX,
+                                      tangentialPhysicalOverlapY,
+                                      tangentialPhysicalOverlapZ);
+    tangentialOverlap -= unitCPVect * tangentialOverlap.dot(unitCPVect);
+    const double tangentialStiffness =
+        8.0 * nEquivShearMod * contactPatchRadius;
+    const double tangentialDamping =
+        2.0 * std::sqrt(5.0 / 6.0) * dampingRatio *
+        std::sqrt(tangentialStiffness * nEquivMass);
+    const CSimple3DVector elasticTangentialForce =
+        -tangentialOverlap * tangentialStiffness;
+    const CSimple3DVector dampingTangentialForce =
+        -relVel_t * tangentialDamping;
+    const CSimple3DVector trialTangentialForce =
+        elasticTangentialForce + dampingTangentialForce;
+    const double tangentialForceLimit =
+        std::max(0.0, staticFriction) * hertzForce;
+
+    CSimple3DVector actualTangentialForce = trialTangentialForce;
+    CSimple3DVector dissipativeTangentialForce = dampingTangentialForce;
+    bool tangentialSliding = false;
+    const double trialTangentialMagnitude = trialTangentialForce.length();
+    if (tangentialForceLimit <= 0.0)
     {
-        //*Frictiom/
-
-        double* FrictionDelta = elem2PropData->getDelta(Friction_PROPERTY.c_str());
-
-        FrictionDelta[0] += hertzForce * staticFriction;
+        tangentialSliding = trialTangentialMagnitude * trialTangentialMagnitude >
+                            VECTOR_EPS_SQUARED;
+        actualTangentialForce = CSimple3DVector();
+        dissipativeTangentialForce = CSimple3DVector();
+        tangentialOverlap = CSimple3DVector();
     }
-   
+    else if (trialTangentialMagnitude > tangentialForceLimit &&
+        trialTangentialMagnitude * trialTangentialMagnitude > VECTOR_EPS_SQUARED)
+    {
+        tangentialSliding = true;
+        actualTangentialForce = trialTangentialForce *
+            (tangentialForceLimit / trialTangentialMagnitude);
+        tangentialOverlap = -actualTangentialForce / tangentialStiffness;
+        dissipativeTangentialForce = actualTangentialForce;
+    }
+
+    calculatedTangentialForceX = actualTangentialForce.dx();
+    calculatedTangentialForceY = actualTangentialForce.dy();
+    calculatedTangentialForceZ = actualTangentialForce.dz();
+    calculatedUnsymTangentialForceX = dissipativeTangentialForce.dx();
+    calculatedUnsymTangentialForceY = dissipativeTangentialForce.dy();
+    calculatedUnsymTangentialForceZ = dissipativeTangentialForce.dz();
+    tangentialPhysicalOverlapX = tangentialOverlap.dx();
+    tangentialPhysicalOverlapY = tangentialOverlap.dy();
+    tangentialPhysicalOverlapZ = tangentialOverlap.dz();
+
+    CSimple3DVector rollingDisplacement = getVectorProperty(
+        contactPropData, ROLLING_DISPLACEMENT_PROPERTY.c_str());
+    rollingDisplacement -= unitCPVect * rollingDisplacement.dot(unitCPVect);
+    const CSimple3DVector relativeAngularVelocity = angVel1 - angVel2;
+    const CSimple3DVector rollingAngularVelocity = relativeAngularVelocity -
+        unitCPVect * relativeAngularVelocity.dot(unitCPVect);
+    const double rollingRadius = elem2IsSurf
+        ? safeEquivalentRadius(elem1PhysicalRadius, elem2PhysicalRadius)
+        : elem1PhysicalRadius;
+    const double positiveRollingFriction = std::max(0.0, rollingFriction);
+
+    double rollingStiffnessPerLength = 0.0;
+    double rollingTorqueLimit = 0.0;
+    if (positiveRollingFriction > 0.0 && isPositiveFinite(rollingRadius))
+    {
+        if (std::isfinite(timestep) && timestep > 0.0)
+        {
+            rollingDisplacement += rollingAngularVelocity *
+                (rollingRadius * timestep);
+        }
+
+        const double coulombRollingLimit =
+            positiveRollingFriction * rollingRadius * hertzForce;
+        if (nSurfaceEnergy > 0.0)
+        {
+            const double zeroOverlapPatch = std::cbrt(
+                4.0 * PI * nSurfaceEnergy * nEquivRadius * nEquivRadius /
+                nEquivYoungsMod);
+            const double pullOffForce =
+                1.5 * PI * nSurfaceEnergy * nEquivRadius;
+            if (isPositiveFinite(zeroOverlapPatch) && isPositiveFinite(pullOffForce))
+            {
+                rollingStiffnessPerLength = 4.0 * pullOffForce *
+                    std::pow(contactPatchRadius / zeroOverlapPatch, 1.5);
+                const double adhesiveRollingLimit = rollingStiffnessPerLength *
+                    positiveRollingFriction * rollingRadius;
+                rollingTorqueLimit = std::min(coulombRollingLimit,
+                                               adhesiveRollingLimit);
+            }
+        }
+        else
+        {
+            rollingStiffnessPerLength =
+                TYPE_C_ROLLING_STIFFNESS_FACTOR * normalStiffness *
+                positiveRollingFriction * positiveRollingFriction * rollingRadius;
+            rollingTorqueLimit = coulombRollingLimit;
+        }
+    }
+
+    CSimple3DVector actualRollingTorque;
+    CSimple3DVector dissipativeRollingTorque;
+    bool rollingSlip = false;
+    if (isPositiveFinite(rollingStiffnessPerLength) &&
+        isPositiveFinite(rollingTorqueLimit))
+    {
+        const double rollingAngularStiffness =
+            rollingStiffnessPerLength * rollingRadius;
+        double moment1 = (elem1MoIX + elem1MoIY + elem1MoIZ) / 3.0;
+        double moment2 = (elem2MoIX + elem2MoIY + elem2MoIZ) / 3.0;
+        double equivalentMoment = moment1;
+        if (elem2IsSurf && isPositiveFinite(moment1) && isPositiveFinite(moment2))
+        {
+            equivalentMoment = moment1 * moment2 / (moment1 + moment2);
+        }
+        if (!isPositiveFinite(equivalentMoment))
+        {
+            equivalentMoment = 0.0;
+        }
+
+        const CSimple3DVector elasticRollingTorque =
+            -rollingDisplacement * rollingStiffnessPerLength;
+        const double rollingDamping = equivalentMoment > 0.0
+            ? 2.0 * dampingRatio *
+              std::sqrt(equivalentMoment * rollingAngularStiffness)
+            : 0.0;
+        const CSimple3DVector dampingRollingTorque =
+            -rollingAngularVelocity * rollingDamping;
+        const CSimple3DVector trialRollingTorque =
+            elasticRollingTorque + dampingRollingTorque;
+        const double trialRollingMagnitude = trialRollingTorque.length();
+
+        actualRollingTorque = trialRollingTorque;
+        dissipativeRollingTorque = dampingRollingTorque;
+        if (trialRollingMagnitude > rollingTorqueLimit &&
+            trialRollingMagnitude * trialRollingMagnitude > VECTOR_EPS_SQUARED)
+        {
+            rollingSlip = true;
+            actualRollingTorque = trialRollingTorque *
+                (rollingTorqueLimit / trialRollingMagnitude);
+            rollingDisplacement = -actualRollingTorque /
+                rollingStiffnessPerLength;
+            dissipativeRollingTorque = actualRollingTorque;
+        }
+    }
+    else
+    {
+        rollingDisplacement = CSimple3DVector();
+        rollingTorqueLimit = 0.0;
+    }
+
+    setVectorProperty(contactPropData, ROLLING_DISPLACEMENT_PROPERTY.c_str(),
+                      rollingDisplacement);
+    calculatedElem1AdditionalTorqueX = actualRollingTorque.dx();
+    calculatedElem1AdditionalTorqueY = actualRollingTorque.dy();
+    calculatedElem1AdditionalTorqueZ = actualRollingTorque.dz();
+    calculatedElem1UnsymAdditionalTorqueX = dissipativeRollingTorque.dx();
+    calculatedElem1UnsymAdditionalTorqueY = dissipativeRollingTorque.dy();
+    calculatedElem1UnsymAdditionalTorqueZ = dissipativeRollingTorque.dz();
+    calculatedElem2AdditionalTorqueX = -actualRollingTorque.dx();
+    calculatedElem2AdditionalTorqueY = -actualRollingTorque.dy();
+    calculatedElem2AdditionalTorqueZ = -actualRollingTorque.dz();
+    calculatedElem2UnsymAdditionalTorqueX = -dissipativeRollingTorque.dx();
+    calculatedElem2UnsymAdditionalTorqueY = -dissipativeRollingTorque.dy();
+    calculatedElem2UnsymAdditionalTorqueZ = -dissipativeRollingTorque.dz();
+
+    // State is a bit mask: 1=established, 2=tangential sliding, 4=rolling slip.
+    double contactState = contactEstablished ? 1.0 : 0.0;
+    if (tangentialSliding)
+    {
+        contactState += 2.0;
+    }
+    if (rollingSlip)
+    {
+        contactState += 4.0;
+    }
+    setPropertyValue(contactPropData, CONTACT_STATE_PROPERTY.c_str(), 0, contactState);
+    setPropertyValue(contactPropData, ACTUAL_TANGENTIAL_FORCE_PROPERTY.c_str(), 0,
+                     actualTangentialForce.length());
+    setPropertyValue(contactPropData, TANGENTIAL_FORCE_LIMIT_PROPERTY.c_str(), 0,
+                     tangentialForceLimit);
+    setPropertyValue(contactPropData, REPULSIVE_NORMAL_FORCE_PROPERTY.c_str(), 0,
+                     hertzForce);
+    setPropertyValue(contactPropData, ADHESIVE_NORMAL_FORCE_PROPERTY.c_str(), 0,
+                     cohesionForce);
+    setPropertyValue(contactPropData, NET_NORMAL_FORCE_PROPERTY.c_str(), 0,
+                     actualNormalForce.length());
+    setPropertyValue(contactPropData, CONTACT_PATCH_RADIUS_PROPERTY.c_str(), 0,
+                     contactPatchRadius);
+    setPropertyValue(contactPropData, CONTACT_SLIP_SPEED_PROPERTY.c_str(), 0,
+                     relVel_t.length());
+    setPropertyValue(contactPropData, ROLLING_TORQUE_PROPERTY.c_str(), 0,
+                     actualRollingTorque.length());
+    setPropertyValue(contactPropData, ROLLING_TORQUE_LIMIT_PROPERTY.c_str(), 0,
+                     rollingTorqueLimit);
+
+    if (!elem2IsSurf && elem2PropData != 0)
+    {
+        if (elem2PropData->hasData(Adhesion_PROPERTY.c_str()))
+        {
+            double* adhesionDelta = elem2PropData->getDelta(Adhesion_PROPERTY.c_str());
+            if (adhesionDelta != 0)
+            {
+                adhesionDelta[0] += cohesionForce;
+            }
+        }
+        if (elem2PropData->hasData(Friction_PROPERTY.c_str()))
+        {
+            double* frictionDelta = elem2PropData->getDelta(Friction_PROPERTY.c_str());
+            if (frictionDelta != 0)
+            {
+                frictionDelta[0] += actualTangentialForce.length();
+            }
+        }
+    }
 
     return eSuccess;
 }
